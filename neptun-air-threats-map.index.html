@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>Карта повітряних загроз України — NEPTUN</title>
+  <meta name="description" content="Жива карта БПЛА, ракет, КАБ та офіційних тривог по Україні. Дані: NEPTUN." />
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css" />
+  <style>
+    :root {
+      --bg: #0b0f1a;
+      --panel: #121826;
+      --text: #e8eef8;
+      --muted: #8b9bb8;
+      --accent: #5aa6ff;
+      --danger: #ff4d4f;
+      --warn: #faad14;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { height: 100%; background: var(--bg); color: var(--text); font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+    #map { position: absolute; inset: 0; }
+    .hud {
+      position: absolute; z-index: 1000; top: 12px; left: 12px; right: 12px;
+      display: flex; flex-wrap: wrap; gap: 8px; pointer-events: none;
+    }
+    .panel {
+      pointer-events: auto; background: rgba(18,24,38,.92); backdrop-filter: blur(8px);
+      border: 1px solid #1e293b; border-radius: 12px; padding: 10px 14px;
+      box-shadow: 0 8px 24px rgba(0,0,0,.4); font-size: 13px;
+    }
+    .title { font-weight: 700; font-size: 15px; margin-bottom: 4px; }
+    .status { color: var(--muted); }
+    .status.live { color: #52c41a; }
+    .legend { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 6px; }
+    .legend span { display: inline-flex; align-items: center; gap: 5px; }
+    .dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+    .attrib {
+      position: absolute; z-index: 1000; bottom: 8px; left: 8px; right: 8px;
+      text-align: center; font-size: 12px; color: var(--muted);
+      background: rgba(11,15,26,.75); padding: 6px 10px; border-radius: 8px;
+    }
+    .attrib a { color: var(--accent); text-decoration: none; }
+    .attrib a:hover { text-decoration: underline; }
+    .leaflet-popup-content-wrapper { background: var(--panel); color: var(--text); border-radius: 10px; }
+    .leaflet-popup-tip { background: var(--panel); }
+    .leaflet-container a.leaflet-popup-close-button { color: var(--muted); }
+    .threat-marker {
+      width: 28px; height: 28px; border-radius: 50%; border: 2px solid #fff;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 14px; box-shadow: 0 2px 8px rgba(0,0,0,.5);
+      transform-origin: center center;
+    }
+    .threat-marker.advisory { opacity: .7; border-style: dashed; }
+    .threat-marker.area-only { border-radius: 6px; }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+
+  <div class="hud">
+    <div class="panel">
+      <div class="title">Повітряні загрози України</div>
+      <div class="status" id="status">Підключення…</div>
+      <div class="legend" id="legend"></div>
+    </div>
+  </div>
+
+  <div class="attrib">
+    Дані: <a href="https://neptun.in.ua/" target="_blank" rel="noopener">Карта повітряних тривог — NEPTUN</a>
+    · Карта: <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">© OpenStreetMap</a>
+    · NEPTUN — інформаційний агрегатор, не офіційна система оповіщення
+  </div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js"></script>
+  <script src="https://neptun.in.ua/sdk/neptun.js"></script>
+  <script>
+    // ——— Карта ———
+    const map = L.map('map', {
+      center: NEPTUN.UKRAINE_CENTER || [48.5, 31.5],
+      zoom: NEPTUN.INITIAL_ZOOM || 6,
+      minZoom: 5,
+      maxZoom: 12,
+      zoomControl: true,
+      attributionControl: false
+    });
+
+    L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+      maxZoom: 19,
+      attribution: '&copy; OpenStreetMap &copy; CARTO'
+    }).addTo(map);
+
+    // ——— Шари ———
+    const threatsLayer = L.layerGroup().addTo(map);
+    const alertsLayer  = L.layerGroup().addTo(map);
+
+    // ——— GeoJSON меж ———
+    let oblastsGeo = null;
+    let raionsGeo  = null;
+    const alertPolygons = new Map(); // key → layer
+
+    async function loadBoundaries() {
+      try {
+        const [o, r] = await Promise.all([
+          fetch('https://neptun.in.ua/oblasts.geojson').then(r => r.json()),
+          fetch('https://neptun.in.ua/raions.geojson').then(r => r.json())
+        ]);
+        oblastsGeo = o;
+        raionsGeo  = r;
+      } catch (e) {
+        console.warn('Не вдалося завантажити межі:', e);
+      }
+    }
+
+    function styleAlert(feature) {
+      return {
+        color: '#ff4d4f',
+        weight: 1.5,
+        opacity: 0.9,
+        fillColor: '#ff4d4f',
+        fillOpacity: 0.18
+      };
+    }
+
+    function updateAlerts(alerts) {
+      alertsLayer.clearLayers();
+      alertPolygons.clear();
+      if (!alerts) return;
+
+      const activeKeys = new Set();
+      (alerts.raions || []).forEach(a => activeKeys.add(a.key));
+      (alerts.oblasts || []).forEach(a => activeKeys.add(a.key));
+
+      // Області
+      if (oblastsGeo) {
+        L.geoJSON(oblastsGeo, {
+          filter: f => activeKeys.has(f.properties.key),
+          style: styleAlert,
+          onEachFeature: (f, layer) => {
+            layer.bindPopup(`<b>${f.properties.region || f.properties.name || f.properties.key}</b><br>Повітряна тривога`);
+            alertsLayer.addLayer(layer);
+          }
+        });
+      }
+      // Райони
+      if (raionsGeo) {
+        L.geoJSON(raionsGeo, {
+          filter: f => activeKeys.has(f.properties.key),
+          style: styleAlert,
+          onEachFeature: (f, layer) => {
+            const name = f.properties.name || f.properties.key;
+            layer.bindPopup(`<b>${name}</b><br>Повітряна тривога`);
+            alertsLayer.addLayer(layer);
+          }
+        });
+      }
+    }
+
+    // ——— Маркери загроз ———
+    const markers = new Map(); // id → { marker, threat }
+
+    function createIcon(type, heading, meta, isAdvisory, isAreaOnly) {
+      const color = meta?.color || '#888';
+      const icon  = meta?.icon  || '●';
+      const rotate = heading != null ? `transform: rotate(${heading}deg);` : '';
+      const cls = ['threat-marker'];
+      if (isAdvisory) cls.push('advisory');
+      if (isAreaOnly) cls.push('area-only');
+
+      return L.divIcon({
+        className: '',
+        html: `<div class="${cls.join(' ')}" style="background:${color};${rotate}">${icon}</div>`,
+        iconSize: [28, 28],
+        iconAnchor: [14, 14]
+      });
+    }
+
+    function popupHtml(t, p) {
+      const meta = NEPTUN.getTypeMeta(t.type) || {};
+      const title = t.title || meta.name || t.type;
+      const conf  = t.confidenceLevel ? ` · ${t.confidenceLevel}` : '';
+      const count = t.count > 1 ? ` ×${t.count}` : '';
+      const loc   = [t.locality, t.district, t.region].filter(Boolean).join(', ');
+      const adv   = t.advisory ? '<br><i style="color:#faad14">Спостереження (не сигнал ховатися)</i>' : '';
+      const area  = t.areaOnly ? '<br><i style="color:#8b9bb8">Лише область (центроїд)</i>' : '';
+      return `
+        <b>${title}${count}</b>${conf}<br>
+        ${loc || '—'}<br>
+        Курс: ${p.heading != null ? Math.round(p.heading) + '°' : '—'}
+        ${t.velocity?.speedKmh ? ' · ' + Math.round(t.velocity.speedKmh) + ' км/г' : ''}
+        ${adv}${area}
+        <br><small>${t.explanationShort || ''}</small>
+      `;
+    }
+
+    function upsertThreat(t) {
+      if (t.status === 'resolved' || !t.lat || !t.lon) {
+        removeThreat(t.id);
+        return;
+      }
+      const now = Date.now();
+      const p = NEPTUN.predict(t, now);
+      const meta = NEPTUN.getTypeMeta(t.type) || {};
+      const isAdv = !!t.advisory;
+      const isArea = !!t.areaOnly;
+
+      let entry = markers.get(t.id);
+      if (!entry) {
+        const icon = createIcon(t.type, p.heading, meta, isAdv, isArea);
+        const m = L.marker([p.lat, p.lon], { icon, zIndexOffset: isAdv ? 100 : 500 });
+        m.bindPopup(() => popupHtml(t, p));
+        threatsLayer.addLayer(m);
+        entry = { marker: m, threat: t };
+        markers.set(t.id, entry);
+      } else {
+        entry.threat = t;
+        entry.marker.setLatLng([p.lat, p.lon]);
+        entry.marker.setIcon(createIcon(t.type, p.heading, meta, isAdv, isArea));
+        entry.marker.setPopupContent(popupHtml(t, p));
+      }
+    }
+
+    function removeThreat(id) {
+      const entry = markers.get(id);
+      if (entry) {
+        threatsLayer.removeLayer(entry.marker);
+        markers.delete(id);
+      }
+    }
+
+    // ——— Анімація (dead-reckoning) ———
+    function animate() {
+      const now = Date.now();
+      for (const { marker, threat } of markers.values()) {
+        if (threat.areaOnly) continue; // без екстраполяції
+        const p = NEPTUN.predict(threat, now);
+        marker.setLatLng([p.lat, p.lon]);
+        if (p.heading != null) {
+          const meta = NEPTUN.getTypeMeta(threat.type) || {};
+          marker.setIcon(createIcon(threat.type, p.heading, meta, !!threat.advisory, false));
+        }
+      }
+      requestAnimationFrame(animate);
+    }
+    requestAnimationFrame(animate);
+
+    // ——— Легенда ———
+    function buildLegend() {
+      const types = ['uav', 'recon', 'missile', 'ballistic', 'kab', 'mig31k', 'unknown'];
+      const el = document.getElementById('legend');
+      el.innerHTML = types.map(type => {
+        const m = NEPTUN.getTypeMeta(type) || { color: '#888', name: type };
+        return `<span><span class="dot" style="background:${m.color}"></span>${m.name || type}</span>`;
+      }).join('');
+    }
+
+    // ——— Клієнт NEPTUN ———
+    const statusEl = document.getElementById('status');
+
+    const client = new NEPTUN.RealtimeClient('https://neptun.in.ua');
+
+    client.subscribe((snap) => {
+      statusEl.textContent = `Онлайн · ${snap.threats?.length || 0} загроз · ${new Date().toLocaleTimeString('uk-UA')}`;
+      statusEl.classList.add('live');
+
+      // Загрози
+      const seen = new Set();
+      (snap.threats || []).forEach(t => {
+        seen.add(t.id);
+        upsertThreat(t);
+      });
+      // Видалити зниклі
+      for (const id of markers.keys()) {
+        if (!seen.has(id)) removeThreat(id);
+      }
+
+      // Тривоги
+      if (snap.alerts || snap.alertOblasts) {
+        updateAlerts({
+          raions: snap.alerts?.raions || snap.alerts || [],
+          oblasts: snap.alerts?.oblasts || snap.alertOblasts || []
+        });
+      }
+    });
+
+    // Старт
+    (async () => {
+      await loadBoundaries();
+      buildLegend();
+      client.start();
+      statusEl.textContent = 'Підключено · очікування даних…';
+    })();
+  </script>
+</body>
+</html>
